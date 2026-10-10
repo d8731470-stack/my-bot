@@ -6,11 +6,6 @@ meta:
 build:
   requirementsPath: requirements.txt
 run:
+  scriptName: main.py
   persistenceMount: /data
   containerPort: 80
-  scriptName: main.py
-  env:
-    - name: TELEGRAM_TOKEN
-      value: "8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg"
-    - name: GROQ_KEY
-      value: "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"
