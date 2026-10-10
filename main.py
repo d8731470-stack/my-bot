@@ -6,8 +6,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from openai import OpenAI
 
 # ============ ЗАМЕНИ ЭТИ ДВЕ СТРОКИ ============
-TELEGRAM_TOKEN = "ВСТАВЬ_В_AMVERA"
-GROQ_KEY = "ВСТАВЬ_В_AMVERA"
+TELEGRAM_TOKEN = "8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg"
+GROQ_KEY = "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"
 # ===============================================
 
 MODEL_TEXT = "llama-3.3-70b-versatile"
