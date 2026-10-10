@@ -7,8 +7,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from openai import OpenAI
 
 # ============ КЛЮЧИ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ AMVERA ============
-TELEGRAM_TOKEN = os.getenv"8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg"
-GROQ_KEY = os.getenv"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"
+TELEGRAM_TOKEN = os.getenv("8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg")
+GROQ_KEY = os.getenv("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")
 # =========================================================
 
 # ============ АКТУАЛЬНЫЕ МОДЕЛИ GROQ ============
