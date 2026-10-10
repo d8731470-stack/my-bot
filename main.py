@@ -1,3 +1,4 @@
+import os
 import logging
 import base64
 import urllib.parse
@@ -5,13 +6,15 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
-# ============ ЗАМЕНИ ЭТИ ДВЕ СТРОКИ ============
-TELEGRAM_TOKEN = "8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg"
-GROQ_KEY = "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"
-# ===============================================
+# ============ КЛЮЧИ БЕРУТСЯ ИЗ ПЕРЕМЕННЫХ AMVERA ============
+TELEGRAM_TOKEN = os.getenv("8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg")
+GROQ_KEY = os.getenv("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")
+# =========================================================
 
+# ============ АКТУАЛЬНЫЕ МОДЕЛИ GROQ ============
 MODEL_TEXT = "llama-3.3-70b-versatile"
-MODEL_VISION = "llama-3.2-11b-vision-preview"
+MODEL_VISION = "meta-llama/llama-4-scout-17b-16e-instruct"
+# =================================================
 
 client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
