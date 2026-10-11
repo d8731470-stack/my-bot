@@ -1,22 +1,21 @@
 import logging
-import base64
 import urllib.parse
 import uuid
 import requests
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ============ ВСТАВЬ СВОИ ЗНАЧЕНИЯ ============
-TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tk"
+TELEGRAM_TOKEN = "8883364704:AAEhTMF3RaROHUYgcm7KHwTl_3Zno_tKKLg"
 GIGACHAT_AUTH_KEY = "MDFhMTJiNmMtZTcyOC03MGRkLTg1MWYtZDZjNjE4YTk1NjczOmQ5MGRmMmZlLTI3NWUtNGQwNC1hN2E1LThhMmJiNzI0MWIzMg=="
 # ==============================================
 
 GIGACHAT_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+GIGACHAT_FILE_URL = "https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
 
 history = {}
-waiting_for_image_prompt = {}  # Кто ждёт ввода промпта для картинки
+awaiting_image = {}  # Кто сейчас ждёт ввода для картинки
 logging.basicConfig(level=logging.INFO)
 
 _access_token = None
@@ -46,33 +45,56 @@ def ask_gigachat(messages):
         "Accept": "application/json",
         "Authorization": f"Bearer {token}",
     }
-    payload = {
-        "model": "GigaChat",
-        "messages": messages,
-        "temperature": 0.7,
-    }
+    payload = {"model": "GigaChat", "messages": messages, "temperature": 0.7}
     response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False)
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
 
-# Клавиатура с кнопкой-иконкой
-main_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton("🎨 Нарисовать картинку")]
-    ],
-    resize_keyboard=True
-)
+def generate_image_gigachat(prompt):
+    token = get_gigachat_token()
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    payload = {
+        "model": "GigaChat",
+        "messages": [
+            {"role": "system", "content": "Ты — художник. Нарисуй то, что просит пользователь."},
+            {"role": "user", "content": prompt},
+        ],
+        "function_call": "auto",
+    }
+    r = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"]
+
+    if "<img src=\"" not in content:
+        return None
+    start = content.find("<img src=\"") + len("<img src=\"")
+    end = content.find("\"", start)
+    file_id = content[start:end]
+
+    file_headers = {"Accept": "application/jpg", "Authorization": f"Bearer {token}"}
+    img_response = requests.get(GIGACHAT_FILE_URL.format(file_id=file_id), headers=file_headers, verify=False, timeout=60)
+    img_response.raise_for_status()
+    return img_response.content
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[update.effective_user.id] = []
+    
+    # Кнопка под сообщением
+    keyboard = [[InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="draw")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
         "Привет! Я ИИ-бот на GigaChat. Умею:\n"
         "💬 Отвечать на текст\n"
-        "🎨 Рисовать картинки (кнопка внизу)\n\n"
-        "Просто напиши что-нибудь!",
-        reply_markup=main_keyboard
+        "🎨 Рисовать картинки\n\n"
+        "Нажми на кнопку ниже или просто напиши что-нибудь!",
+        reply_markup=reply_markup
     )
 
 
@@ -81,83 +103,60 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("История диалога очищена.")
 
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия на кнопку"""
+    query = update.callback_query
+    await query.answer()  # Обязательно ответить на callback [citation:3]
+    
+    if query.data == "draw":
+        awaiting_image[query.from_user.id] = True
+        await query.message.reply_text("✍️ Напиши, что нарисовать. Например: собака сидит на коте")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Если пользователь нажал на кнопку "Нарисовать картинку"
-    if text == "🎨 Нарисовать картинку":
-        waiting_for_image_prompt[user_id] = True
-        await update.message.reply_text(
-            "✏️ Напишите текст, что хотите сгенерировать.\n"
-            "Например: кот обнимает собаку",
-            reply_markup=main_keyboard
-        )
+    # Если пользователь нажал кнопку и ждёт ввода для картинки
+    if awaiting_image.get(user_id):
+        awaiting_image[user_id] = False
+        await update.message.reply_text("🎨 Рисую... Это займёт 10-20 секунд.")
+        try:
+            image_bytes = generate_image_gigachat(text)
+            if image_bytes:
+                await update.message.reply_photo(photo=image_bytes)
+            else:
+                await update.message.reply_text("Не удалось сгенерировать. Попробуй другой запрос.")
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка картинки: {e}")
         return
 
-    # Если пользователь ждёт ввода промпта для картинки
-    if waiting_for_image_prompt.get(user_id):
-        waiting_for_image_prompt[user_id] = False
-        await generate_image_by_prompt(update, text)
-        return
-
-    # Обычный диалог с GigaChat
+    # Обычный текстовый ответ
     if user_id not in history:
         history[user_id] = []
 
     history[user_id].append({"role": "user", "content": text})
-
     messages = [{"role": "system", "content": "Ты дружелюбный помощник. Отвечай на русском языке."}]
     messages += history[user_id][-20:]
-
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
         answer = ask_gigachat(messages)
         history[user_id].append({"role": "assistant", "content": answer})
-        await update.message.reply_text(answer, reply_markup=main_keyboard)
+        
+        # Показываем кнопку и после обычного ответа
+        keyboard = [[InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="draw")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(answer, reply_markup=reply_markup)
     except Exception as e:
         await update.message.reply_text(f"Ошибка ИИ: {e}")
-
-
-async def generate_image_by_prompt(update: Update, prompt: str):
-    """Генерирует картинку по текстовому промпту"""
-    await update.message.chat.send_action(action=ChatAction.UPLOAD_PHOTO)
-
-    # Переводим промпт на английский через GigaChat
-    english_prompt = prompt
-    try:
-        translate_messages = [
-            {"role": "system", "content": "You are a translator for an image generation service. Translate the user's text to English. Add descriptive style words (photorealistic, high detail, 4k) at the end. Reply ONLY with the translated prompt, no explanations."},
-            {"role": "user", "content": prompt}
-        ]
-        english_prompt = ask_gigachat(translate_messages).strip()
-    except Exception as e:
-        logging.warning(f"Translation failed: {e}")
-
-    url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(english_prompt)}?width=1024&height=1024&nologo=true"
-
-    try:
-        await update.message.reply_photo(photo=url, caption=f"🎨 {prompt}", reply_markup=main_keyboard)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка картинки: {e}", reply_markup=main_keyboard)
-
-
-async def img_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старая команда /img — оставим для совместимости"""
-    prompt = " ".join(context.args)
-    if not prompt:
-        waiting_for_image_prompt[update.effective_user.id] = True
-        await update.message.reply_text("✏️ Напишите текст, что хотите сгенерировать:")
-        return
-    await generate_image_by_prompt(update, prompt)
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("img", img_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущен...")
     app.run_polling()
