@@ -6,9 +6,10 @@ import urllib.parse
 import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ChatAction
 
 # ============ ВСТАВЬ СВОИ ЗНАЧЕНИЯ ============
-TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tk"
+TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tkд"
 GIGACHAT_AUTH_KEY = "MDFhMTJiNmMtZTcyOC03MGRkLTg1MWYtZDZjNjE4YTk1NjczOmQ5MGRmMmZlLTI3NWUtNGQwNC1hN2E1LThhMmJiNzI0MWIzMg=="
 # ==============================================
 
@@ -50,8 +51,7 @@ def get_gigachat_token():
     return _access_token
 
 
-def request_with_retry(func, max_attempts=3):
-    """Повторяет запрос до 3 раз при ошибке 500"""
+def request_with_retry(func, max_attempts=5):
     last_error = None
     for attempt in range(max_attempts):
         try:
@@ -60,13 +60,14 @@ def request_with_retry(func, max_attempts=3):
             if e.response is not None and e.response.status_code == 500:
                 last_error = e
                 if attempt < max_attempts - 1:
-                    time.sleep(2)  # Пауза 2 секунды перед повтором
+                    logging.warning(f"Ошибка 500, попытка {attempt + 1}/{max_attempts}, ждём 5 сек...")
+                    time.sleep(5)
                     continue
             raise
         except requests.exceptions.RequestException as e:
             last_error = e
             if attempt < max_attempts - 1:
-                time.sleep(2)
+                time.sleep(5)
                 continue
             raise
     raise last_error
@@ -120,6 +121,37 @@ def generate_image_gigachat(prompt):
     return request_with_retry(_call)
 
 
+def analyze_photo_gigachat(photo_bytes):
+    def _call():
+        token = get_gigachat_token()
+        upload_headers = {"Authorization": f"Bearer {token}"}
+        files = {"file": ("photo.jpg", photo_bytes, "image/jpeg")}
+        upload_url = "https://gigachat.devices.sberbank.ru/api/v1/files"
+        upload_response = requests.post(upload_url, headers=upload_headers, files=files, verify=False, timeout=60)
+        upload_response.raise_for_status()
+        file_id = upload_response.json()["id"]
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Что на этом фото? Опиши кратко на русском.",
+                    "attachments": [file_id]
+                }
+            ]
+        }
+        response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    return request_with_retry(_call)
+
+
 def web_search(query):
     try:
         url = "https://api.duckduckgo.com/"
@@ -133,7 +165,7 @@ def web_search(query):
             if data.get("AbstractURL"):
                 results.append(f"Источник: {data['AbstractURL']}")
 
-        for topic in data.get("RelatedTopics", [])[:5]:
+        for topic in data.get("RelatedTopics", [])[:3]:
             if isinstance(topic, dict) and topic.get("Text"):
                 results.append(f"• {topic['Text']}")
 
@@ -152,7 +184,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я ИИ-бот на GigaChat. Умею:\n"
         "💬 Отвечать на текст\n"
         "🎨 Рисовать картинки\n"
-        "🔍 Искать в интернете\n\n"
+        "🔍 Искать в интернете\n"
+        "🖼️ Анализировать фото\n\n"
         "Кнопки внизу — выбери, что нужно!",
         reply_markup=MAIN_KEYBOARD
     )
@@ -182,9 +215,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔍 Что искать? Напиши запрос.")
             return
 
+        # --- Генерация картинки ---
         if awaiting_mode.get(user_id) == "image":
             awaiting_mode[user_id] = None
             await update.message.reply_text("🎨 Рисую... 10-20 секунд.")
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
             try:
                 image_bytes = generate_image_gigachat(text)
                 if image_bytes:
@@ -195,9 +230,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Ошибка картинки: {e}", reply_markup=MAIN_KEYBOARD)
             return
 
+        # --- Поиск в интернете ---
         if awaiting_mode.get(user_id) == "search":
             awaiting_mode[user_id] = None
             await update.message.reply_text(f"🔍 Ищу: {text}...")
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
             search_results = web_search(text)
             messages = [
                 {"role": "system", "content": "Ты помощник. Используй результаты поиска, чтобы ответить на вопрос. Отвечай кратко на русском."},
@@ -210,6 +247,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
             return
 
+        # --- Обычный текстовый ответ ---
         if user_id not in history:
             history[user_id] = []
 
@@ -217,6 +255,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages = [{"role": "system", "content": "Ты дружелюбный помощник. Отвечай на русском языке."}]
         messages += history[user_id][-20:]
 
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         try:
             answer = ask_gigachat(messages)
             history[user_id].append({"role": "assistant", "content": answer})
@@ -225,11 +264,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
 
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик фотографий"""
+    user_id = update.effective_user.id
+
+    # Сообщаем, что анализируем
+    await update.message.reply_text("🔍 Анализирую фото...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    try:
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        answer = analyze_photo_gigachat(photo_bytes)
+        await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка фото: {e}", reply_markup=MAIN_KEYBOARD)
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     print("Бот запущен...")
     app.run_polling()
 
