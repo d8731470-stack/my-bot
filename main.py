@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ChatAction
 
 # ============ ВСТАВЬ СВОИ ЗНАЧЕНИЯ ============
-TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tk"
+TELEGRAM_TOKEN = "8883364704:AAHktqDaA1KwjuRcjxsg70ruWbZvxSr_g38"
 GIGACHAT_AUTH_KEY = "MDFhMTJiNmMtZTcyOC03MGRkLTg1MWYtZDZjNjE4YTk1NjczOmQ5MGRmMmZlLTI3NWUtNGQwNC1hN2E1LThhMmJiNzI0MWIzMg=="
 # ==============================================
 
@@ -32,6 +32,19 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
     is_persistent=True,
 )
+
+
+async def keep_typing(chat_id, context, action=ChatAction.TYPING, stop_event=None):
+    """Показывает 'печатает...' каждые 4 секунды, пока не остановят"""
+    while not stop_event.is_set():
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=action)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4)
+        except asyncio.TimeoutError:
+            continue
 
 
 def get_gigachat_token():
@@ -81,7 +94,7 @@ def ask_gigachat(messages):
             "Accept": "application/json",
             "Authorization": f"Bearer {token}",
         }
-        payload = {"model": "GigaChat", "messages": messages, "temperature": 0.7}
+        payload = {"model": "GigaChat-2", "messages": messages, "temperature": 0.7}
         response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
@@ -97,7 +110,7 @@ def generate_image_gigachat(prompt):
             "Authorization": f"Bearer {token}",
         }
         payload = {
-            "model": "GigaChat",
+            "model": "GigaChat-2",
             "messages": [
                 {"role": "system", "content": "Ты — художник. Нарисуй то, что просит пользователь."},
                 {"role": "user", "content": prompt},
@@ -137,7 +150,7 @@ def analyze_photo_gigachat(photo_bytes):
             "Authorization": f"Bearer {token}",
         }
         payload = {
-            "model": "GigaChat",
+            "model": "GigaChat-2",
             "messages": [
                 {
                     "role": "user",
@@ -219,22 +232,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if awaiting_mode.get(user_id) == "image":
             awaiting_mode[user_id] = None
             await update.message.reply_text("🎨 Рисую... 10-20 секунд.")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
+            stop_event = asyncio.Event()
+            typing_task = asyncio.create_task(keep_typing(update.effective_chat.id, context, ChatAction.UPLOAD_PHOTO, stop_event))
             try:
                 image_bytes = generate_image_gigachat(text)
+                stop_event.set()
                 if image_bytes:
                     await update.message.reply_photo(photo=image_bytes, reply_markup=MAIN_KEYBOARD)
                 else:
                     await update.message.reply_text("Не удалось сгенерировать. Попробуй другой запрос.", reply_markup=MAIN_KEYBOARD)
             except Exception as e:
+                stop_event.set()
                 await update.message.reply_text(f"Ошибка картинки: {e}", reply_markup=MAIN_KEYBOARD)
+            finally:
+                typing_task.cancel()
             return
 
         # --- Поиск в интернете ---
         if awaiting_mode.get(user_id) == "search":
             awaiting_mode[user_id] = None
             await update.message.reply_text(f"🔍 Ищу: {text}...")
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+            stop_event = asyncio.Event()
+            typing_task = asyncio.create_task(keep_typing(update.effective_chat.id, context, ChatAction.TYPING, stop_event))
             search_results = web_search(text)
             messages = [
                 {"role": "system", "content": "Ты помощник. Используй результаты поиска, чтобы ответить на вопрос. Отвечай кратко на русском."},
@@ -242,12 +261,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             try:
                 answer = ask_gigachat(messages)
+                stop_event.set()
                 await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
             except Exception as e:
+                stop_event.set()
                 await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
+            finally:
+                typing_task.cancel()
             return
 
-        # --- Обычный текстовый ответ ---
+        # --- Обычный текст ---
         if user_id not in history:
             history[user_id] = []
 
@@ -255,41 +278,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages = [{"role": "system", "content": "Ты дружелюбный помощник. Отвечай на русском языке."}]
         messages += history[user_id][-20:]
 
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(keep_typing(update.effective_chat.id, context, ChatAction.TYPING, stop_event))
         try:
             answer = ask_gigachat(messages)
+            stop_event.set()
             history[user_id].append({"role": "assistant", "content": answer})
             await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
         except Exception as e:
+            stop_event.set()
             await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
+        finally:
+            typing_task.cancel()
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик фотографий"""
     user_id = update.effective_user.id
-
-    # Сообщаем, что анализируем
     await update.message.reply_text("🔍 Анализирую фото...")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
+    stop_event = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(update.effective_chat.id, context, ChatAction.TYPING, stop_event))
     try:
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         answer = analyze_photo_gigachat(photo_bytes)
+        stop_event.set()
         await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
     except Exception as e:
+        stop_event.set()
         await update.message.reply_text(f"Ошибка фото: {e}", reply_markup=MAIN_KEYBOARD)
+    finally:
+        typing_task.cancel()
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("Бот запущен...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
