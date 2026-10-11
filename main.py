@@ -1,9 +1,10 @@
 import logging
-import urllib.parse
 import uuid
+import asyncio
+import urllib.parse
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ============ ВСТАВЬ СВОИ ЗНАЧЕНИЯ ============
 TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tk"
@@ -15,10 +16,21 @@ GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions
 GIGACHAT_FILE_URL = "https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
 
 history = {}
-awaiting_image = {}  # Кто сейчас ждёт ввода для картинки
+awaiting_mode = {}  # "image" или "search"
+user_locks = {}
 logging.basicConfig(level=logging.INFO)
 
 _access_token = None
+
+# Нижняя клавиатура с двумя кнопками
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🎨 Нарисовать картинку")],
+        [KeyboardButton("🔍 Поиск в интернете")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 def get_gigachat_token():
@@ -46,7 +58,7 @@ def ask_gigachat(messages):
         "Authorization": f"Bearer {token}",
     }
     payload = {"model": "GigaChat", "messages": messages, "temperature": 0.7}
-    response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False)
+    response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
 
@@ -82,81 +94,121 @@ def generate_image_gigachat(prompt):
     return img_response.content
 
 
+def web_search(query):
+    """Поиск через DuckDuckGo (бесплатно, без ключей)"""
+    try:
+        url = "https://api.duckduckgo.com/"
+        params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+
+        results = []
+        if data.get("AbstractText"):
+            results.append(f"Кратко: {data['AbstractText']}")
+            if data.get("AbstractURL"):
+                results.append(f"Источник: {data['AbstractURL']}")
+
+        for topic in data.get("RelatedTopics", [])[:5]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                results.append(f"• {topic['Text']}")
+
+        if not results:
+            results.append(f"Прямых ответов нет. Полный поиск: https://duckduckgo.com/?q={urllib.parse.quote(query)}")
+
+        return "\n".join(results)
+    except Exception as e:
+        return f"Ошибка поиска: {e}"
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[update.effective_user.id] = []
-    
-    # Кнопка под сообщением
-    keyboard = [[InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="draw")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+    awaiting_mode[update.effective_user.id] = None
     await update.message.reply_text(
         "Привет! Я ИИ-бот на GigaChat. Умею:\n"
         "💬 Отвечать на текст\n"
-        "🎨 Рисовать картинки\n\n"
-        "Нажми на кнопку ниже или просто напиши что-нибудь!",
-        reply_markup=reply_markup
+        "🎨 Рисовать картинки\n"
+        "🔍 Искать в интернете\n\n"
+        "Кнопки внизу — выбери, что нужно!",
+        reply_markup=MAIN_KEYBOARD
     )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history[update.effective_user.id] = []
-    await update.message.reply_text("История диалога очищена.")
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатия на кнопку"""
-    query = update.callback_query
-    await query.answer()  # Обязательно ответить на callback [citation:3]
-    
-    if query.data == "draw":
-        awaiting_image[query.from_user.id] = True
-        await query.message.reply_text("✍️ Напиши, что нарисовать. Например: собака сидит на коте")
+    awaiting_mode[update.effective_user.id] = None
+    await update.message.reply_text("История очищена.", reply_markup=MAIN_KEYBOARD)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text
 
-    # Если пользователь нажал кнопку и ждёт ввода для картинки
-    if awaiting_image.get(user_id):
-        awaiting_image[user_id] = False
-        await update.message.reply_text("🎨 Рисую... Это займёт 10-20 секунд.")
+    if user_id not in user_locks:
+        user_locks[user_id] = asyncio.Lock()
+
+    async with user_locks[user_id]:
+        # --- Кнопка "Нарисовать" ---
+        if text == "🎨 Нарисовать картинку":
+            awaiting_mode[user_id] = "image"
+            await update.message.reply_text("✍️ Напиши, что нарисовать. Например: собака на коте")
+            return
+
+        # --- Кнопка "Поиск" ---
+        if text == "🔍 Поиск в интернете":
+            awaiting_mode[user_id] = "search"
+            await update.message.reply_text("🔍 Что искать? Напиши запрос.")
+            return
+
+        # --- Режим генерации картинки ---
+        if awaiting_mode.get(user_id) == "image":
+            awaiting_mode[user_id] = None
+            await update.message.reply_text("🎨 Рисую... 10-20 секунд.")
+            try:
+                image_bytes = generate_image_gigachat(text)
+                if image_bytes:
+                    await update.message.reply_photo(photo=image_bytes, reply_markup=MAIN_KEYBOARD)
+                else:
+                    await update.message.reply_text("Не удалось сгенерировать. Попробуй другой запрос.", reply_markup=MAIN_KEYBOARD)
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка картинки: {e}", reply_markup=MAIN_KEYBOARD)
+            return
+
+        # --- Режим поиска в интернете ---
+        if awaiting_mode.get(user_id) == "search":
+            awaiting_mode[user_id] = None
+            await update.message.reply_text(f"🔍 Ищу: {text}...")
+            search_results = web_search(text)
+            messages = [
+                {"role": "system", "content": "Ты помощник. Используй результаты поиска, чтобы ответить на вопрос. Отвечай кратко на русском."},
+                {"role": "user", "content": f"Вопрос: {text}\n\nРезультаты:\n{search_results}"},
+            ]
+            try:
+                answer = ask_gigachat(messages)
+                await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
+            except Exception as e:
+                await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
+            return
+
+        # --- Обычный текстовый ответ ---
+        if user_id not in history:
+            history[user_id] = []
+
+        history[user_id].append({"role": "user", "content": text})
+        messages = [{"role": "system", "content": "Ты дружелюбный помощник. Отвечай на русском языке."}]
+        messages += history[user_id][-20:]
+
         try:
-            image_bytes = generate_image_gigachat(text)
-            if image_bytes:
-                await update.message.reply_photo(photo=image_bytes)
-            else:
-                await update.message.reply_text("Не удалось сгенерировать. Попробуй другой запрос.")
+            answer = ask_gigachat(messages)
+            history[user_id].append({"role": "assistant", "content": answer})
+            await update.message.reply_text(answer, reply_markup=MAIN_KEYBOARD)
         except Exception as e:
-            await update.message.reply_text(f"Ошибка картинки: {e}")
-        return
-
-    # Обычный текстовый ответ
-    if user_id not in history:
-        history[user_id] = []
-
-    history[user_id].append({"role": "user", "content": text})
-    messages = [{"role": "system", "content": "Ты дружелюбный помощник. Отвечай на русском языке."}]
-    messages += history[user_id][-20:]
-
-    try:
-        answer = ask_gigachat(messages)
-        history[user_id].append({"role": "assistant", "content": answer})
-        
-        # Показываем кнопку и после обычного ответа
-        keyboard = [[InlineKeyboardButton("🎨 Нарисовать картинку", callback_data="draw")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(answer, reply_markup=reply_markup)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка ИИ: {e}")
+            await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
 
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущен...")
     app.run_polling()
