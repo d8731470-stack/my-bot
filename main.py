@@ -1,6 +1,7 @@
 import logging
 import uuid
 import asyncio
+import time
 import urllib.parse
 import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -16,13 +17,12 @@ GIGACHAT_API_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions
 GIGACHAT_FILE_URL = "https://gigachat.devices.sberbank.ru/api/v1/files/{file_id}/content"
 
 history = {}
-awaiting_mode = {}  # "image" или "search"
+awaiting_mode = {}
 user_locks = {}
 logging.basicConfig(level=logging.INFO)
 
 _access_token = None
 
-# Нижняя клавиатура с двумя кнопками
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🎨 Нарисовать картинку")],
@@ -44,58 +44,83 @@ def get_gigachat_token():
         "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
     }
     data = {"scope": "GIGACHAT_API_PERS"}
-    response = requests.post(GIGACHAT_AUTH_URL, headers=headers, data=data, verify=False)
+    response = requests.post(GIGACHAT_AUTH_URL, headers=headers, data=data, verify=False, timeout=30)
     response.raise_for_status()
     _access_token = response.json()["access_token"]
     return _access_token
 
 
+def request_with_retry(func, max_attempts=3):
+    """Повторяет запрос до 3 раз при ошибке 500"""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return func()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 500:
+                last_error = e
+                if attempt < max_attempts - 1:
+                    time.sleep(2)  # Пауза 2 секунды перед повтором
+                    continue
+            raise
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                time.sleep(2)
+                continue
+            raise
+    raise last_error
+
+
 def ask_gigachat(messages):
-    token = get_gigachat_token()
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    payload = {"model": "GigaChat", "messages": messages, "temperature": 0.7}
-    response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    def _call():
+        token = get_gigachat_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        payload = {"model": "GigaChat", "messages": messages, "temperature": 0.7}
+        response = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    return request_with_retry(_call)
 
 
 def generate_image_gigachat(prompt):
-    token = get_gigachat_token()
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    payload = {
-        "model": "GigaChat",
-        "messages": [
-            {"role": "system", "content": "Ты — художник. Нарисуй то, что просит пользователь."},
-            {"role": "user", "content": prompt},
-        ],
-        "function_call": "auto",
-    }
-    r = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"]
+    def _call():
+        token = get_gigachat_token()
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        payload = {
+            "model": "GigaChat",
+            "messages": [
+                {"role": "system", "content": "Ты — художник. Нарисуй то, что просит пользователь."},
+                {"role": "user", "content": prompt},
+            ],
+            "function_call": "auto",
+        }
+        r = requests.post(GIGACHAT_API_URL, headers=headers, json=payload, verify=False, timeout=60)
+        r.raise_for_status()
+        content = r.json()["choices"][0]["message"]["content"]
 
-    if "<img src=\"" not in content:
-        return None
-    start = content.find("<img src=\"") + len("<img src=\"")
-    end = content.find("\"", start)
-    file_id = content[start:end]
+        if "<img src=\"" not in content:
+            return None
+        start = content.find("<img src=\"") + len("<img src=\"")
+        end = content.find("\"", start)
+        file_id = content[start:end]
 
-    file_headers = {"Accept": "application/jpg", "Authorization": f"Bearer {token}"}
-    img_response = requests.get(GIGACHAT_FILE_URL.format(file_id=file_id), headers=file_headers, verify=False, timeout=60)
-    img_response.raise_for_status()
-    return img_response.content
+        file_headers = {"Accept": "application/jpg", "Authorization": f"Bearer {token}"}
+        img_response = requests.get(GIGACHAT_FILE_URL.format(file_id=file_id), headers=file_headers, verify=False, timeout=60)
+        img_response.raise_for_status()
+        return img_response.content
+    return request_with_retry(_call)
 
 
 def web_search(query):
-    """Поиск через DuckDuckGo (бесплатно, без ключей)"""
     try:
         url = "https://api.duckduckgo.com/"
         params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
@@ -147,19 +172,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_locks[user_id] = asyncio.Lock()
 
     async with user_locks[user_id]:
-        # --- Кнопка "Нарисовать" ---
         if text == "🎨 Нарисовать картинку":
             awaiting_mode[user_id] = "image"
             await update.message.reply_text("✍️ Напиши, что нарисовать. Например: собака на коте")
             return
 
-        # --- Кнопка "Поиск" ---
         if text == "🔍 Поиск в интернете":
             awaiting_mode[user_id] = "search"
             await update.message.reply_text("🔍 Что искать? Напиши запрос.")
             return
 
-        # --- Режим генерации картинки ---
         if awaiting_mode.get(user_id) == "image":
             awaiting_mode[user_id] = None
             await update.message.reply_text("🎨 Рисую... 10-20 секунд.")
@@ -173,7 +195,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Ошибка картинки: {e}", reply_markup=MAIN_KEYBOARD)
             return
 
-        # --- Режим поиска в интернете ---
         if awaiting_mode.get(user_id) == "search":
             awaiting_mode[user_id] = None
             await update.message.reply_text(f"🔍 Ищу: {text}...")
@@ -189,7 +210,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Ошибка ИИ: {e}", reply_markup=MAIN_KEYBOARD)
             return
 
-        # --- Обычный текстовый ответ ---
         if user_id not in history:
             history[user_id] = []
 
