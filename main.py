@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.constants import ChatAction
 
 # ============ ВСТАВЬ СВОИ ЗНАЧЕНИЯ ============
-TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tkд"
+TELEGRAM_TOKEN = "8883364704:AAGUZPOmNLu1WQIQeAJ00_G7YW8dIzhN3tk"
 GIGACHAT_AUTH_KEY = "MDFhMTJiNmMtZTcyOC03MGRkLTg1MWYtZDZjNjE4YTk1NjczOmQ5MGRmMmZlLTI3NWUtNGQwNC1hN2E1LThhMmJiNzI0MWIzMg=="
 # ==============================================
 
